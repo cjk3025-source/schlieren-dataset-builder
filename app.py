@@ -319,6 +319,26 @@ def build_truth_dataframe(state: Dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def get_specimen_display_name(registry_df: pd.DataFrame, specimen_id: str) -> str:
+    if not specimen_id:
+        return "-"
+    if registry_df is None or registry_df.empty or "specimen_id" not in registry_df.columns:
+        return specimen_id
+    matched = registry_df.loc[registry_df["specimen_id"] == specimen_id]
+    if matched.empty:
+        return specimen_id
+    row = matched.iloc[0]
+    laser_name = str(row.get("laser_power_label", "")).strip()
+    laser_display = str(row.get("laser_power", "")).strip()
+    if laser_name and laser_display and laser_name != laser_display:
+        return f"{specimen_id} · {laser_name} ({laser_display})"
+    if laser_name:
+        return f"{specimen_id} · {laser_name}"
+    if laser_display:
+        return f"{specimen_id} · {laser_display}"
+    return specimen_id
+
+
 def specimen_assets(project_root: Path, specimen_id: str) -> SpecimenAssets:
     pp = get_project_paths(project_root)
     specimen_dir = ensure_dir(pp["raw"] / specimen_id)
@@ -963,6 +983,7 @@ specimen_ids = registry_df["specimen_id"].tolist() if not registry_df.empty else
 if specimen_ids and not state["ui"].get("selected_specimen"):
     state["ui"]["selected_specimen"] = specimen_ids[0]
 selected_specimen = state["ui"].get("selected_specimen", specimen_ids[0] if specimen_ids else "")
+selected_specimen_display = get_specimen_display_name(registry_df, selected_specimen)
 
 st.markdown("### 현재 작업 시편")
 if specimen_ids:
@@ -976,6 +997,8 @@ if specimen_ids:
         persist_state(project_root, state)
     else:
         selected_specimen = new_specimen
+    selected_specimen_display = get_specimen_display_name(registry_df, selected_specimen)
+    st.caption(f"선택된 시편: {selected_specimen_display}")
 else:
     st.info("실험표를 먼저 저장하면 시편 목록이 만들어집니다.")
 
@@ -1055,7 +1078,7 @@ with setup_tab:
         st.success("저장되었습니다.")
 
 with upload_tab:
-    st.subheader(f"업로드 · {selected_specimen or '-'}")
+    st.subheader(f"업로드 · {selected_specimen_display or '-'}")
     if not selected_specimen:
         st.info("실험표를 먼저 저장해주세요.")
     else:
@@ -1173,7 +1196,7 @@ with upload_tab:
             st.dataframe(dataset_df[["item_id", "image_name", "mask_name", "prediction_name", "status", "image_size", "mask_size", "mask_values", "invalid_values"]], use_container_width=True, height=280)
 
 with review_tab:
-    st.subheader(f"Review · {selected_specimen or '-'}")
+    st.subheader(f"Review · {selected_specimen_display or '-'}")
     if not selected_specimen:
         st.info("실험표를 먼저 저장해주세요.")
     else:
@@ -1352,7 +1375,7 @@ with quality_tab:
                     st.success("일괄 저장되었습니다.")
 
 with tools_tab:
-    st.subheader(f"Tools · {selected_specimen or '-'}")
+    st.subheader(f"Tools · {selected_specimen_display or '-'}")
     if not selected_specimen:
         st.info("실험표를 먼저 저장해주세요.")
     else:
