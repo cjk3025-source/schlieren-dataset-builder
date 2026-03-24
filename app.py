@@ -4,6 +4,8 @@ import math
 import os
 import shutil
 import zipfile
+from datetime import datetime, timezone
+from xml.sax.saxutils import escape
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -136,6 +138,14 @@ class SpecimenAssets:
     frames_dir: Path
     raw_video: Optional[Path]
     frame_paths: List[Path]
+
+
+@dataclass
+class ResultBundle:
+    root_dir: Path
+    frame_paths: List[Path]
+    video_path: Optional[Path]
+    mode: str
 
 
 def merge_defaults(obj: Dict[str, Any], default: Dict[str, Any]) -> Dict[str, Any]:
@@ -295,6 +305,14 @@ def auto_final_label(visual_result: str, tensile_result: str, fallback: str = "�
     return fallback if fallback == "review_needed" else "미입력"
 
 
+def build_quality_detail(specimen_id: str, final_label: str, visual_result: str, tensile_result: str, defect_type: str = "") -> str:
+    text = f"{specimen_id} 시편은 최종 {final_label}입니다. 외관 검사 결과는 {visual_result}, 인장 시험 결과는 {tensile_result}입니다."
+    defect_type = (defect_type or "").strip()
+    if defect_type:
+        text += f" 불량 유형은 {defect_type}입니다."
+    return text
+
+
 def build_truth_dataframe(state: Dict[str, Any]) -> pd.DataFrame:
     registry = build_registry_dataframe(state)
     truth = state.get("truth", {})
@@ -304,14 +322,15 @@ def build_truth_dataframe(state: Dict[str, Any]) -> pd.DataFrame:
         visual_result = t.get("visual_result", "미입력")
         tensile_result = t.get("tensile_result", "미입력")
         final_label = auto_final_label(visual_result, tensile_result, t.get("final_label", "미입력"))
+        defect_type = t.get("defect_type", "")
         short = f"{specimen_id} 시편은 {final_label}입니다."
-        details = t.get("details", "")
+        details = t.get("details") or build_quality_detail(specimen_id, final_label, visual_result, tensile_result, defect_type)
         rows.append({
             "specimen_id": specimen_id,
             "final_label": final_label,
             "visual_result": visual_result,
             "tensile_result": tensile_result,
-            "defect_type": t.get("defect_type", ""),
+            "defect_type": defect_type,
             "notes": t.get("notes", ""),
             "summary_short": short,
             "summary_detail": details,
@@ -322,21 +341,48 @@ def build_truth_dataframe(state: Dict[str, Any]) -> pd.DataFrame:
 def get_specimen_display_name(registry_df: pd.DataFrame, specimen_id: str) -> str:
     if not specimen_id:
         return "-"
+    return specimen_id
+
+
+def get_specimen_meta_text(registry_df: pd.DataFrame, specimen_id: str) -> str:
+    if not specimen_id:
+        return ""
     if registry_df is None or registry_df.empty or "specimen_id" not in registry_df.columns:
-        return specimen_id
+        return ""
     matched = registry_df.loc[registry_df["specimen_id"] == specimen_id]
     if matched.empty:
-        return specimen_id
+        return ""
     row = matched.iloc[0]
+    meta_parts: List[str] = []
     laser_name = str(row.get("laser_power_label", "")).strip()
-    laser_display = str(row.get("laser_power", "")).strip()
-    if laser_name and laser_display and laser_name != laser_display:
-        return f"{specimen_id} · {laser_name} ({laser_display})"
     if laser_name:
-        return f"{specimen_id} · {laser_name}"
+        meta_parts.append(laser_name)
+    laser_display = str(row.get("laser_power", "")).strip()
     if laser_display:
-        return f"{specimen_id} · {laser_display}"
-    return specimen_id
+        meta_parts.append(laser_display)
+    welding_speed = str(row.get("welding_speed", "")).strip()
+    if welding_speed:
+        meta_parts.append(welding_speed)
+    defocusing = str(row.get("defocusing", "")).strip()
+    if defocusing:
+        meta_parts.append(f"defocusing {defocusing}")
+    repeat_index = str(row.get("repeat_index", "")).strip()
+    if repeat_index:
+        meta_parts.append(f"repeat {repeat_index}")
+    return " · ".join(meta_parts)
+
+
+def render_specimen_header(registry_df: pd.DataFrame, specimen_id: str) -> None:
+    title = get_specimen_display_name(registry_df, specimen_id) or "-"
+    meta = get_specimen_meta_text(registry_df, specimen_id)
+    if meta:
+        st.markdown(
+            f"<h3 style='margin-bottom:0.1rem'>{escape(title)}</h3>"
+            f"<div style='color:#8a8f98;font-size:0.92rem;margin-bottom:0.8rem'>{escape(meta)}</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.subheader(title)
 
 
 def specimen_assets(project_root: Path, specimen_id: str) -> SpecimenAssets:
@@ -730,6 +776,67 @@ def specimen_prediction_dir(project_root: Path, specimen_id: str) -> Path:
     return ensure_dir(get_project_paths(project_root)["processed"] / specimen_id / "predictions")
 
 
+def specimen_fume_result_dir(project_root: Path, specimen_id: str) -> Path:
+    return ensure_dir(get_project_paths(project_root)["processed"] / specimen_id / "fume_result")
+
+
+def specimen_spatter_result_dir(project_root: Path, specimen_id: str) -> Path:
+    return ensure_dir(get_project_paths(project_root)["processed"] / specimen_id / "spatter_result")
+
+
+def load_result_bundle(target_dir: Path) -> ResultBundle:
+    ensure_dir(target_dir)
+    frame_paths = sorted([p for p in target_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMG_EXTS])
+    video_path = next((p for p in sorted(target_dir.rglob("*")) if p.is_file() and p.suffix.lower() in VIDEO_EXTS), None)
+    if frame_paths:
+        mode = "frames"
+    elif video_path is not None:
+        mode = "video"
+    else:
+        mode = "none"
+    return ResultBundle(target_dir, frame_paths, video_path, mode)
+
+
+def find_result_frame(bundle: ResultBundle, item_id: str) -> Optional[Path]:
+    for p in bundle.frame_paths:
+        if p.stem == item_id:
+            return p
+    return None
+
+
+def replace_uploaded_result_bundle(uploaded_file: Any, target_dir: Path) -> Dict[str, Any]:
+    ensure_dir(target_dir)
+    shutil.rmtree(target_dir, ignore_errors=True)
+    ensure_dir(target_dir)
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix == ".zip":
+        count = 0
+        with zipfile.ZipFile(io.BytesIO(uploaded_file.getvalue())) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                name = Path(info.filename).name
+                if not name:
+                    continue
+                if Path(name).suffix.lower() in IMG_EXTS:
+                    with zf.open(info) as src, open(target_dir / name, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                        count += 1
+        return {"mode": "frames", "count": count, "name": Path(uploaded_file.name).name}
+    if suffix in VIDEO_EXTS:
+        save_uploaded_file(uploaded_file, target_dir / Path(uploaded_file.name).name)
+        return {"mode": "video", "count": 1, "name": Path(uploaded_file.name).name}
+    return {"mode": "unsupported", "count": 0, "name": Path(uploaded_file.name).name}
+
+
+def summarize_result_bundle(bundle: ResultBundle) -> str:
+    if bundle.mode == "frames":
+        return f"frames:{len(bundle.frame_paths)}"
+    if bundle.mode == "video" and bundle.video_path is not None:
+        return f"video:{bundle.video_path.name}"
+    return "none"
+
+
 def save_uploaded_png_sets(uploaded_files: List[Any], target_dir: Path) -> int:
     ensure_dir(target_dir)
     count = 0
@@ -799,31 +906,57 @@ def blend_overlay(image: np.ndarray, mask: np.ndarray, alpha: float = 0.35, show
 
 def build_dataset_rows(project_root: Path, specimen_id: str, state: Dict[str, Any]) -> pd.DataFrame:
     assets = specimen_assets(project_root, specimen_id)
+    fume_bundle = load_result_bundle(specimen_fume_result_dir(project_root, specimen_id))
+    spatter_bundle = load_result_bundle(specimen_spatter_result_dir(project_root, specimen_id))
     image_map = {p.stem: p for p in assets.frame_paths}
     mask_map = {p.stem: p for p in specimen_mask_dir(project_root, specimen_id).glob("*.png")}
     pred_map = {p.stem: p for p in specimen_prediction_dir(project_root, specimen_id).glob("*.png")}
-    all_keys = sorted(set(image_map.keys()) | set(mask_map.keys()) | set(pred_map.keys()))
+    fume_map = {p.stem: p for p in fume_bundle.frame_paths}
+    spatter_map = {p.stem: p for p in spatter_bundle.frame_paths}
+    all_keys = sorted(set(image_map.keys()) | set(mask_map.keys()) | set(pred_map.keys()) | set(fume_map.keys()) | set(spatter_map.keys()))
     truth = state.get("truth", {}).get(specimen_id, {})
     rows: List[Dict[str, Any]] = []
     for key in all_keys:
         image_path = image_map.get(key)
         mask_path = mask_map.get(key)
         pred_path = pred_map.get(key)
+        fume_path = fume_map.get(key)
+        spatter_path = spatter_map.get(key)
         if image_path is not None and not image_path.exists():
             image_path = None
         if mask_path is not None and not mask_path.exists():
             mask_path = None
         if pred_path is not None and not pred_path.exists():
             pred_path = None
+        if fume_path is not None and not fume_path.exists():
+            fume_path = None
+        if spatter_path is not None and not spatter_path.exists():
+            spatter_path = None
+
+        has_fume_output = bool(fume_path or fume_bundle.video_path or fume_bundle.frame_paths)
+        has_spatter_output = bool(spatter_path or spatter_bundle.video_path or spatter_bundle.frame_paths)
+        fume_output_type = "frames" if fume_path is not None else ("video" if fume_bundle.video_path is not None else ("frames_unmatched" if fume_bundle.frame_paths else "none"))
+        spatter_output_type = "frames" if spatter_path is not None else ("video" if spatter_bundle.video_path is not None else ("frames_unmatched" if spatter_bundle.frame_paths else "none"))
+        fume_output_path = str(fume_path) if fume_path is not None else (str(fume_bundle.video_path) if fume_bundle.video_path is not None else (str(fume_bundle.root_dir) if fume_bundle.frame_paths else ""))
+        spatter_output_path = str(spatter_path) if spatter_path is not None else (str(spatter_bundle.video_path) if spatter_bundle.video_path is not None else (str(spatter_bundle.root_dir) if spatter_bundle.frame_paths else ""))
+
         row: Dict[str, Any] = {
             "item_id": key,
             "image_name": image_path.name if image_path else "",
             "mask_name": mask_path.name if mask_path else "",
             "prediction_name": pred_path.name if pred_path else "",
+            "fume_output_name": fume_path.name if fume_path else (fume_bundle.video_path.name if fume_bundle.video_path else ""),
+            "spatter_output_name": spatter_path.name if spatter_path else (spatter_bundle.video_path.name if spatter_bundle.video_path else ""),
             "has_image": image_path is not None,
             "has_mask": mask_path is not None,
             "has_prediction": pred_path is not None,
-            "status": "ready" if image_path and mask_path else ("missing_image" if mask_path and not image_path else "missing_mask" if image_path and not mask_path else "orphan_prediction"),
+            "has_fume_output": has_fume_output,
+            "has_spatter_output": has_spatter_output,
+            "fume_output_type": fume_output_type,
+            "spatter_output_type": spatter_output_type,
+            "fume_output_path": fume_output_path,
+            "spatter_output_path": spatter_output_path,
+            "status": "ready" if image_path and mask_path else ("missing_image" if mask_path and not image_path else "missing_mask" if image_path and not mask_path else ("secondary_only" if (pred_path or has_fume_output or has_spatter_output) else "unmatched")),
             "quality_label": auto_final_label(truth.get("visual_result", "미입력"), truth.get("tensile_result", "미입력"), truth.get("final_label", "미입력")),
             "reviewed": truth.get("reviewed", False),
         }
@@ -835,7 +968,7 @@ def build_dataset_rows(project_root: Path, specimen_id: str, state: Dict[str, An
                 row["image_size"] = ""
                 row["has_image"] = False
                 row["image_name"] = ""
-                row["status"] = "missing_image" if mask_path else "orphan_prediction"
+                row["status"] = "missing_image" if mask_path else ("secondary_only" if (pred_path or has_fume_output or has_spatter_output) else "unmatched")
                 image_path = None
         else:
             row["image_size"] = ""
@@ -865,7 +998,9 @@ def build_dataset_rows(project_root: Path, specimen_id: str, state: Dict[str, An
         rows.append(row)
     if not rows:
         return pd.DataFrame(columns=[
-            "item_id", "image_name", "mask_name", "prediction_name", "has_image", "has_mask", "has_prediction",
+            "item_id", "image_name", "mask_name", "prediction_name", "fume_output_name", "spatter_output_name",
+            "has_image", "has_mask", "has_prediction", "has_fume_output", "has_spatter_output",
+            "fume_output_type", "spatter_output_type", "fume_output_path", "spatter_output_path",
             "status", "image_size", "mask_size", "mask_values", "invalid_values", "has_fume", "has_spatter",
             "has_ignore", "empty_mask", "ignore_only", "size_match", "quality_label", "reviewed"
         ])
@@ -878,17 +1013,165 @@ def save_truth_from_dataframe(project_root: Path, df: pd.DataFrame, state: Dict[
         sid = str(row["specimen_id"])
         visual_result = row.get("visual_result", "")
         tensile_result = row.get("tensile_result", "")
+        defect_type = row.get("defect_type", "")
+        final_label = auto_final_label(visual_result, tensile_result, row.get("final_label", "미입력"))
         truth[sid] = {
-            "final_label": auto_final_label(visual_result, tensile_result, row.get("final_label", "미입력")),
+            "final_label": final_label,
             "visual_result": visual_result,
             "tensile_result": tensile_result,
-            "defect_type": row.get("defect_type", ""),
+            "defect_type": defect_type,
             "notes": row.get("notes", ""),
-            "details": row.get("summary_detail", ""),
+            "details": build_quality_detail(sid, final_label, visual_result, tensile_result, defect_type),
         }
     state["truth"] = truth
     save_state(project_root, state)
 
+
+
+def make_excel_sheet_name(raw_name: str, used_names: set[str]) -> str:
+    cleaned = str(raw_name or "Sheet")
+    for ch in ("\\", "/", "?", "*", "[", "]", ":"):
+        cleaned = cleaned.replace(ch, "_")
+    cleaned = cleaned.strip() or "Sheet"
+    base = cleaned[:31]
+    candidate = base
+    suffix = 1
+    while candidate in used_names:
+        suffix_str = f"_{suffix}"
+        candidate = f"{base[:31-len(suffix_str)]}{suffix_str}"
+        suffix += 1
+    used_names.add(candidate)
+    return candidate
+
+
+
+
+
+def _excel_column_name(index: int) -> str:
+    letters: List[str] = []
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        letters.append(chr(65 + remainder))
+    return "".join(reversed(letters))
+
+
+def _xlsx_cell_xml(cell_ref: str, value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return f'<c r="{cell_ref}" t="inlineStr"><is><t></t></is></c>'
+    if isinstance(value, (int, np.integer)):
+        return f'<c r="{cell_ref}"><v>{int(value)}</v></c>'
+    if isinstance(value, (float, np.floating)) and not pd.isna(value):
+        return f'<c r="{cell_ref}"><v>{float(value)}</v></c>'
+    text = escape(str(value))
+    return f'<c r="{cell_ref}" t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>'
+
+
+def write_multi_sheet_xlsx(workbook_path: Path, sheets: List[Tuple[str, pd.DataFrame]]) -> None:
+    ensure_dir(workbook_path.parent)
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+    workbook_entries: List[str] = []
+    workbook_rels: List[str] = []
+    content_type_entries: List[str] = []
+    sheet_xml_map: Dict[str, str] = {}
+
+    for idx, (sheet_name, df) in enumerate(sheets, start=1):
+        workbook_entries.append(f'<sheet name="{escape(sheet_name)}" sheetId="{idx}" r:id="rId{idx}"/>')
+        workbook_rels.append(f'<Relationship Id="rId{idx}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{idx}.xml"/>')
+        content_type_entries.append(f'<Override PartName="/xl/worksheets/sheet{idx}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
+
+        working_df = df.copy()
+        columns = [str(col) for col in working_df.columns.tolist()]
+        rows_xml: List[str] = []
+
+        header_cells = []
+        for col_idx, col_name in enumerate(columns, start=1):
+            cell_ref = f"{_excel_column_name(col_idx)}1"
+            header_cells.append(_xlsx_cell_xml(cell_ref, col_name))
+        rows_xml.append(f'<row r="1">{"".join(header_cells)}</row>')
+
+        if not working_df.empty:
+            for row_idx, row in enumerate(working_df.itertuples(index=False, name=None), start=2):
+                cell_xml = []
+                for col_idx, value in enumerate(row, start=1):
+                    cell_ref = f"{_excel_column_name(col_idx)}{row_idx}"
+                    cell_xml.append(_xlsx_cell_xml(cell_ref, value))
+                rows_xml.append(f'<row r="{row_idx}">{"".join(cell_xml)}</row>')
+
+        last_col = _excel_column_name(max(len(columns), 1))
+        last_row = max(len(working_df) + 1, 1)
+        dimension = f"A1:{last_col}{last_row}"
+        sheet_xml_map[f"xl/worksheets/sheet{idx}.xml"] = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f'<dimension ref="{dimension}"/>'
+            '<sheetViews><sheetView workbookViewId="0"/></sheetViews>'
+            '<sheetFormatPr defaultRowHeight="15"/>'
+            f'<sheetData>{"".join(rows_xml)}</sheetData>'
+            '</worksheet>'
+        )
+
+    workbook_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' 
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets>' + ''.join(workbook_entries) + '</sheets>'
+        '</workbook>'
+    )
+    workbook_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        + ''.join(workbook_rels) +
+        '</Relationships>'
+    )
+    content_types_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+        '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
+        + ''.join(content_type_entries) +
+        '</Types>'
+    )
+    root_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>'
+        '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>'
+        '</Relationships>'
+    )
+    core_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" ' 
+        'xmlns:dc="http://purl.org/dc/elements/1.1/" ' 
+        'xmlns:dcterms="http://purl.org/dc/terms/" ' 
+        'xmlns:dcmitype="http://purl.org/dc/dcmitype/" ' 
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+        '<dc:creator>OpenAI</dc:creator>'
+        '<cp:lastModifiedBy>OpenAI</cp:lastModifiedBy>'
+        f'<dcterms:created xsi:type="dcterms:W3CDTF">{timestamp}</dcterms:created>'
+        f'<dcterms:modified xsi:type="dcterms:W3CDTF">{timestamp}</dcterms:modified>'
+        '</cp:coreProperties>'
+    )
+    app_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" ' 
+        'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+        '<Application>Python</Application>'
+        '</Properties>'
+    )
+
+    with zipfile.ZipFile(workbook_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr('[Content_Types].xml', content_types_xml)
+        zf.writestr('_rels/.rels', root_rels_xml)
+        zf.writestr('docProps/core.xml', core_xml)
+        zf.writestr('docProps/app.xml', app_xml)
+        zf.writestr('xl/workbook.xml', workbook_xml)
+        zf.writestr('xl/_rels/workbook.xml.rels', workbook_rels_xml)
+        for sheet_path, sheet_xml in sheet_xml_map.items():
+            zf.writestr(sheet_path, sheet_xml)
 
 
 def export_handoff(project_root: Path, state: Dict[str, Any]) -> Path:
@@ -900,6 +1183,7 @@ def export_handoff(project_root: Path, state: Dict[str, Any]) -> Path:
     truth_df.to_csv(export_dir / "ground_truth.csv", index=False, encoding="utf-8-sig")
     safe_write_json(export_dir / "external_conditions.json", state["settings"]["external_conditions"])
     dataset_summary_rows: List[pd.DataFrame] = []
+    dataset_sheet_rows: List[Tuple[str, pd.DataFrame]] = []
     for specimen_id in registry["specimen_id"].tolist():
         out = ensure_dir(export_dir / specimen_id)
         raw_assets = specimen_assets(project_root, specimen_id)
@@ -913,13 +1197,31 @@ def export_handoff(project_root: Path, state: Dict[str, Any]) -> Path:
         pred_dir = specimen_prediction_dir(project_root, specimen_id)
         if pred_dir.exists():
             shutil.copytree(pred_dir, out / "predictions", dirs_exist_ok=True)
+        fume_dir = specimen_fume_result_dir(project_root, specimen_id)
+        if any(fume_dir.iterdir()):
+            shutil.copytree(fume_dir, out / "fume_result", dirs_exist_ok=True)
+        spatter_dir = specimen_spatter_result_dir(project_root, specimen_id)
+        if any(spatter_dir.iterdir()):
+            shutil.copytree(spatter_dir, out / "spatter_result", dirs_exist_ok=True)
         dataset_df = build_dataset_rows(project_root, specimen_id, state)
-        if not dataset_df.empty:
-            dataset_df.insert(0, "specimen_id", specimen_id)
-            dataset_df.to_csv(out / "dataset_manifest.csv", index=False, encoding="utf-8-sig")
-            dataset_summary_rows.append(dataset_df)
+        dataset_with_specimen = dataset_df.copy()
+        dataset_with_specimen.insert(0, "specimen_id", specimen_id)
+        dataset_with_specimen.to_csv(out / "dataset_manifest.csv", index=False, encoding="utf-8-sig")
+        dataset_sheet_rows.append((specimen_id, dataset_with_specimen))
+        if not dataset_with_specimen.empty:
+            dataset_summary_rows.append(dataset_with_specimen)
     if dataset_summary_rows:
         pd.concat(dataset_summary_rows, ignore_index=True).to_csv(export_dir / "dataset_manifest_all.csv", index=False, encoding="utf-8-sig")
+    else:
+        pd.DataFrame(columns=["specimen_id"]).to_csv(export_dir / "dataset_manifest_all.csv", index=False, encoding="utf-8-sig")
+    if dataset_sheet_rows:
+        workbook_path = export_dir / "dataset_manifest_all.xlsx"
+        used_sheet_names: set[str] = set()
+        workbook_sheets: List[Tuple[str, pd.DataFrame]] = []
+        for specimen_id, dataset_with_specimen in dataset_sheet_rows:
+            sheet_name = make_excel_sheet_name(specimen_id, used_sheet_names)
+            workbook_sheets.append((sheet_name, dataset_with_specimen))
+        write_multi_sheet_xlsx(workbook_path, workbook_sheets)
     zip_path = export_dir.with_suffix(".zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for p in export_dir.rglob("*"):
@@ -935,7 +1237,7 @@ def persist_state(project_root: Path, state: Dict[str, Any]) -> None:
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("최종 이미지·mask 업로드 · 검토 · 품질 라벨 · handoff export")
+st.caption("전처리 이미지·최종 mask·Fume/Spatter 2차 전처리 결과 업로드 · 검토 · 품질 라벨 · handoff export")
 
 # Sidebar project management
 with st.sidebar:
@@ -984,6 +1286,7 @@ if specimen_ids and not state["ui"].get("selected_specimen"):
     state["ui"]["selected_specimen"] = specimen_ids[0]
 selected_specimen = state["ui"].get("selected_specimen", specimen_ids[0] if specimen_ids else "")
 selected_specimen_display = get_specimen_display_name(registry_df, selected_specimen)
+selected_specimen_meta = get_specimen_meta_text(registry_df, selected_specimen)
 
 st.markdown("### 현재 작업 시편")
 if specimen_ids:
@@ -1007,7 +1310,6 @@ setup_tab, upload_tab, review_tab, quality_tab, tools_tab, export_tab = st.tabs(
 ])
 
 with setup_tab:
-    st.subheader("실험표 설정")
     st.info("이 앱에서는 전처리·ROI·웹 내 라벨링을 수행하지 않습니다. OpenCV/Python rule-based 전처리 → LabelMe 라벨링 → U-Net 자동 라벨링/수정 후 최종 PNG mask를 업로드해주세요.")
     left, right = st.columns([1.2, 1])
     with left:
@@ -1078,15 +1380,24 @@ with setup_tab:
         st.success("저장되었습니다.")
 
 with upload_tab:
-    st.subheader(f"업로드 · {selected_specimen_display or '-'}")
+    render_specimen_header(registry_df, selected_specimen)
     if not selected_specimen:
         st.info("실험표를 먼저 저장해주세요.")
     else:
         assets = specimen_assets(project_root, selected_specimen)
         mask_dir = specimen_mask_dir(project_root, selected_specimen)
-        pred_dir = specimen_prediction_dir(project_root, selected_specimen)
-        st.caption("권장 포맷: 이미지 파일명과 mask 파일명 stem 일치 (예: sample_001.jpg ↔ sample_001.png). Mask PNG 값은 background=0, fume=1, spatter=2, ignore=3 을 권장합니다.")
-        st.info("최종 이미지 업로드는 원본/검토 기준 이미지(raw 성격의 최종 이미지) ZIP 1개만 받습니다. 새 ZIP을 적용하면 기존 이미지 업로드는 전부 삭제되고 교체됩니다.")
+        fume_dir = specimen_fume_result_dir(project_root, selected_specimen)
+        spatter_dir = specimen_spatter_result_dir(project_root, selected_specimen)
+        fume_bundle = load_result_bundle(fume_dir)
+        spatter_bundle = load_result_bundle(spatter_dir)
+        st.caption("권장 포맷: 전처리 이미지 파일명과 mask 파일명 stem 일치 (예: sample_001.jpg ↔ sample_001.png). Mask PNG 값은 background=0, fume=1, spatter=2, ignore=3 을 권장합니다.")
+        st.info("전처리 이미지 업로드는 rule-based 1차 전처리까지 끝난 기준 이미지 ZIP 1개만 받습니다. 여기에 더해 2차 전처리(U-Net) 결과물은 Fume 전용과 Spatter 전용으로 각각 따로 업로드합니다. ZIP(프레임 묶음) 또는 영상 1개를 시편 단위로 적용하면 기존 데이터는 해당 종류만 교체됩니다.")
+
+        with st.expander("업로드 항목 설명", expanded=False):
+            st.markdown("- **전처리 이미지 업로드**: OpenCV/Python rule-based 1차 전처리 후 LabelMe 라벨링에 사용한 기준 이미지 ZIP")
+            st.markdown("- **최종 Mask PNG 업로드**: 사람이 최종 확정한 mask PNG. 전처리 이미지와 파일명 stem이 1:1로 맞아야 합니다.")
+            st.markdown("- **Fume 결과물 업로드**: U-Net 2차 전처리로 분리된 흄 전용 결과물. ZIP(프레임) 또는 영상 1개를 업로드합니다.")
+            st.markdown("- **Spatter 결과물 업로드**: U-Net 2차 전처리로 분리된 스패터 전용 결과물. ZIP(프레임) 또는 영상 1개를 업로드합니다.")
 
         flash_key = f"upload_flash_{selected_specimen}"
         flash_message = st.session_state.pop(flash_key, None)
@@ -1095,30 +1406,32 @@ with upload_tab:
 
         frame_nonce_key = f"frame_zip_nonce_{selected_specimen}"
         mask_nonce_key = f"mask_upload_nonce_{selected_specimen}"
-        pred_nonce_key = f"pred_upload_nonce_{selected_specimen}"
+        fume_nonce_key = f"fume_upload_nonce_{selected_specimen}"
+        spatter_nonce_key = f"spatter_upload_nonce_{selected_specimen}"
         st.session_state.setdefault(frame_nonce_key, 0)
         st.session_state.setdefault(mask_nonce_key, 0)
-        st.session_state.setdefault(pred_nonce_key, 0)
+        st.session_state.setdefault(fume_nonce_key, 0)
+        st.session_state.setdefault(spatter_nonce_key, 0)
 
-        img_col, mask_col, pred_col = st.columns(3)
-        with img_col:
+        row1_col1, row1_col2 = st.columns(2)
+        with row1_col1:
             up_frames_zip = st.file_uploader(
-                "최종 이미지 ZIP 업로드",
+                "전처리 이미지 ZIP 업로드",
                 accept_multiple_files=False,
                 type=["zip"],
                 key=f"frames_zip_{selected_specimen}_{st.session_state[frame_nonce_key]}",
-                help="2000장 이상처럼 많은 이미지도 ZIP 1개로 업로드하세요. 적용 시 기존 이미지는 누적되지 않고 전체 교체됩니다.",
+                help="2000장 이상처럼 많은 전처리 이미지도 ZIP 1개로 업로드하세요. 적용 시 기존 이미지는 누적되지 않고 전체 교체됩니다.",
             )
             if up_frames_zip is not None:
                 st.caption(f"선택됨: {up_frames_zip.name} · {up_frames_zip.size / (1024 * 1024):.1f} MB")
-                if st.button("최종 이미지 ZIP 적용", type="primary", key=f"apply_frames_zip_{selected_specimen}_{st.session_state[frame_nonce_key]}"):
+                if st.button("전처리 이미지 ZIP 적용", type="primary", key=f"apply_frames_zip_{selected_specimen}_{st.session_state[frame_nonce_key]}"):
                     with st.spinner("이미지 ZIP 압축 해제 및 교체 중..."):
                         cnt = replace_uploaded_frames_from_zip(up_frames_zip, assets.specimen_dir)
                         st.cache_data.clear()
-                    st.session_state[flash_key] = f"이미지 교체 완료: {cnt}장"
+                    st.session_state[flash_key] = f"전처리 이미지 교체 완료: {cnt}장"
                     st.session_state[frame_nonce_key] += 1
                     st.rerun()
-        with mask_col:
+        with row1_col2:
             up_masks = st.file_uploader(
                 "최종 Mask PNG 업로드",
                 accept_multiple_files=True,
@@ -1134,34 +1447,62 @@ with upload_tab:
                     st.session_state[flash_key] = f"Mask 저장 완료: {cnt}장"
                     st.session_state[mask_nonce_key] += 1
                     st.rerun()
-        with pred_col:
-            up_preds = st.file_uploader(
-                "예측 Mask 업로드(선택)",
-                accept_multiple_files=True,
-                type=["png", "zip"],
-                key=f"preds_{selected_specimen}_{st.session_state[pred_nonce_key]}",
+
+        row2_col1, row2_col2 = st.columns(2)
+        with row2_col1:
+            up_fume = st.file_uploader(
+                "Fume 결과물 업로드 (ZIP 또는 영상)",
+                accept_multiple_files=False,
+                type=["zip", "mp4", "avi", "mov", "mkv", "wmv", "mpg", "mpeg"],
+                key=f"fume_result_{selected_specimen}_{st.session_state[fume_nonce_key]}",
             )
-            if up_preds:
-                st.caption(f"선택된 파일 수: {len(up_preds)}")
-                if st.button("예측 Mask 업로드 적용", key=f"apply_preds_{selected_specimen}_{st.session_state[pred_nonce_key]}"):
-                    with st.spinner("예측 mask 업로드 중..."):
-                        cnt = save_uploaded_png_sets(up_preds, pred_dir)
+            if up_fume is not None:
+                st.caption(f"선택됨: {up_fume.name} · {up_fume.size / (1024 * 1024):.1f} MB")
+                if st.button("Fume 결과물 적용", key=f"apply_fume_{selected_specimen}_{st.session_state[fume_nonce_key]}"):
+                    with st.spinner("Fume 결과물 업로드 중..."):
+                        result = replace_uploaded_result_bundle(up_fume, fume_dir)
                         st.cache_data.clear()
-                    st.session_state[flash_key] = f"예측 mask 저장 완료: {cnt}장"
-                    st.session_state[pred_nonce_key] += 1
+                    if result["mode"] == "frames":
+                        st.session_state[flash_key] = f"Fume 결과물 저장 완료: {result['count']}장"
+                    elif result["mode"] == "video":
+                        st.session_state[flash_key] = f"Fume 결과물 저장 완료: {result['name']}"
+                    else:
+                        st.session_state[flash_key] = "Fume 결과물 형식을 확인해주세요."
+                    st.session_state[fume_nonce_key] += 1
+                    st.rerun()
+        with row2_col2:
+            up_spatter = st.file_uploader(
+                "Spatter 결과물 업로드 (ZIP 또는 영상)",
+                accept_multiple_files=False,
+                type=["zip", "mp4", "avi", "mov", "mkv", "wmv", "mpg", "mpeg"],
+                key=f"spatter_result_{selected_specimen}_{st.session_state[spatter_nonce_key]}",
+            )
+            if up_spatter is not None:
+                st.caption(f"선택됨: {up_spatter.name} · {up_spatter.size / (1024 * 1024):.1f} MB")
+                if st.button("Spatter 결과물 적용", key=f"apply_spatter_{selected_specimen}_{st.session_state[spatter_nonce_key]}"):
+                    with st.spinner("Spatter 결과물 업로드 중..."):
+                        result = replace_uploaded_result_bundle(up_spatter, spatter_dir)
+                        st.cache_data.clear()
+                    if result["mode"] == "frames":
+                        st.session_state[flash_key] = f"Spatter 결과물 저장 완료: {result['count']}장"
+                    elif result["mode"] == "video":
+                        st.session_state[flash_key] = f"Spatter 결과물 저장 완료: {result['name']}"
+                    else:
+                        st.session_state[flash_key] = "Spatter 결과물 형식을 확인해주세요."
+                    st.session_state[spatter_nonce_key] += 1
                     st.rerun()
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         mask_count = len(list(mask_dir.glob("*.png")))
-        pred_count = len(list(pred_dir.glob("*.png")))
-        m1.metric("현재 이미지 수", len(assets.frame_paths))
+        m1.metric("전처리 이미지 수", len(assets.frame_paths))
         m2.metric("최종 mask 수", mask_count)
-        m3.metric("예측 mask 수", pred_count)
+        m3.metric("Fume 결과", summarize_result_bundle(fume_bundle))
+        m4.metric("Spatter 결과", summarize_result_bundle(spatter_bundle))
         dataset_df = build_dataset_rows(project_root, selected_specimen, state)
         ready_count = int((dataset_df["status"] == "ready").sum()) if not dataset_df.empty else 0
-        m4.metric("매칭 완료", ready_count)
+        m5.metric("매칭 완료", ready_count)
 
-        action1, action2, action3 = st.columns(3)
+        action1, action2, action3, action4 = st.columns(4)
         if action1.button("현재 시편 이미지 비우기"):
             reset_uploaded_frames(assets.specimen_dir)
             st.cache_data.clear()
@@ -1175,12 +1516,19 @@ with upload_tab:
             st.session_state[flash_key] = "현재 시편 mask를 비웠습니다."
             st.session_state[mask_nonce_key] += 1
             st.rerun()
-        if action3.button("현재 시편 prediction 비우기"):
-            shutil.rmtree(pred_dir, ignore_errors=True)
-            ensure_dir(pred_dir)
+        if action3.button("현재 시편 Fume 결과 비우기"):
+            shutil.rmtree(fume_dir, ignore_errors=True)
+            ensure_dir(fume_dir)
             st.cache_data.clear()
-            st.session_state[flash_key] = "현재 시편 prediction을 비웠습니다."
-            st.session_state[pred_nonce_key] += 1
+            st.session_state[flash_key] = "현재 시편 Fume 결과물을 비웠습니다."
+            st.session_state[fume_nonce_key] += 1
+            st.rerun()
+        if action4.button("현재 시편 Spatter 결과 비우기"):
+            shutil.rmtree(spatter_dir, ignore_errors=True)
+            ensure_dir(spatter_dir)
+            st.cache_data.clear()
+            st.session_state[flash_key] = "현재 시편 Spatter 결과물을 비웠습니다."
+            st.session_state[spatter_nonce_key] += 1
             st.rerun()
 
         if not dataset_df.empty:
@@ -1190,19 +1538,22 @@ with upload_tab:
                 "정상 매칭": int((dataset_df["status"] == "ready").sum()),
                 "mask 누락": int((dataset_df["status"] == "missing_mask").sum()),
                 "이미지 누락": int((dataset_df["status"] == "missing_image").sum()),
+                "Fume 결과 연결": int(dataset_df["has_fume_output"].sum()),
+                "Spatter 결과 연결": int(dataset_df["has_spatter_output"].sum()),
                 "해상도 불일치": int((~dataset_df["size_match"] & dataset_df["has_image"] & dataset_df["has_mask"]).sum()),
             }
             st.json(summary)
-            st.dataframe(dataset_df[["item_id", "image_name", "mask_name", "prediction_name", "status", "image_size", "mask_size", "mask_values", "invalid_values"]], use_container_width=True, height=280)
+            st.dataframe(dataset_df[["item_id", "image_name", "mask_name", "fume_output_type", "spatter_output_type", "status", "image_size", "mask_size", "mask_values", "invalid_values"]], use_container_width=True, height=280)
+
 
 with review_tab:
-    st.subheader(f"Review · {selected_specimen_display or '-'}")
+    render_specimen_header(registry_df, selected_specimen)
     if not selected_specimen:
         st.info("실험표를 먼저 저장해주세요.")
     else:
         dataset_df = build_dataset_rows(project_root, selected_specimen, state)
         if dataset_df.empty:
-            st.info("먼저 이미지와 mask를 업로드해주세요.")
+            st.info("먼저 전처리 이미지와 mask를 업로드해주세요.")
         else:
             with st.expander("필터", expanded=True):
                 c1, c2, c3, c4 = st.columns(4)
@@ -1223,15 +1574,16 @@ with review_tab:
             s2.metric("매칭 완료", int((filtered["status"] == "ready").sum()))
             s3.metric("문제 항목", int(((filtered["status"] != "ready") | (~filtered["size_match"]) | (filtered["invalid_values"] != "") | (filtered["empty_mask"]) | (filtered["ignore_only"])).sum()))
             s4.metric("미검토", int(((filtered["quality_label"] == "미입력") | (~filtered["reviewed"])).sum()))
-            st.caption("Review 탭에서는 선택한 프레임만 간단히 확인합니다. 상세 자동 점검표(item_id / has_fume / has_spatter 등)는 Tools 탭에서 확인할 수 있습니다.")
+            st.caption("Review 탭에서는 선택한 항목에 대해 기준 이미지, Fume 분리 결과, Spatter 분리 결과를 가볍게 확인합니다. 상세 자동 점검표는 Tools 탭에서 확인할 수 있습니다.")
 
             item_ids = filtered["item_id"].tolist() or dataset_df["item_id"].tolist()
             item_id = st.selectbox("검토할 항목", item_ids)
             row = dataset_df[dataset_df["item_id"] == item_id].iloc[0].to_dict()
             image_path = None
             mask_path = None
-            pred_path = None
             assets = specimen_assets(project_root, selected_specimen)
+            fume_bundle = load_result_bundle(specimen_fume_result_dir(project_root, selected_specimen))
+            spatter_bundle = load_result_bundle(specimen_spatter_result_dir(project_root, selected_specimen))
             for p in assets.frame_paths:
                 if p.stem == item_id:
                     image_path = p
@@ -1239,53 +1591,87 @@ with review_tab:
             candidate_mask = specimen_mask_dir(project_root, selected_specimen) / f"{item_id}.png"
             if candidate_mask.exists():
                 mask_path = candidate_mask
-            candidate_pred = specimen_prediction_dir(project_root, selected_specimen) / f"{item_id}.png"
-            if candidate_pred.exists():
-                pred_path = candidate_pred
+            matched_fume_frame = find_result_frame(fume_bundle, item_id)
+            matched_spatter_frame = find_result_frame(spatter_bundle, item_id)
 
             badge_parts = [f"status={row['status']}"]
             if row["quality_label"] != "미입력":
                 badge_parts.append(f"quality={row['quality_label']}")
             badge_parts.append(f"reviewed={bool(row['reviewed'])}")
-            if row["has_prediction"]:
-                badge_parts.append("prediction=Y")
+            badge_parts.append(f"fume_output={row['fume_output_type']}")
+            badge_parts.append(f"spatter_output={row['spatter_output_type']}")
             st.markdown(" · ".join(badge_parts))
 
-            with st.expander("보기 옵션", expanded=True):
-                opt1, opt2, opt3, opt4 = st.columns(4)
-                show_mask = opt1.checkbox("Mask 보기", value=False)
-                show_overlay = opt2.checkbox("Overlay 보기", value=False)
-                show_ignore = opt3.checkbox("Ignore 표시", value=False)
-                show_prediction = opt4.checkbox("Prediction 보기", value=False)
-                opacity = st.slider("Overlay 투명도", min_value=0.1, max_value=0.9, value=0.35, step=0.05)
+            main_tab, fume_tab, spatter_tab = st.tabs(["기준 이미지 / Mask", "Fume 결과", "Spatter 결과"])
 
-            preview_cols = []
-            if image_path and image_path.exists():
-                image_preview = try_load_frame_image(str(image_path))
-                if image_preview is not None:
-                    preview_cols.append(("원본 이미지", image_preview))
-            if mask_path and mask_path.exists() and show_mask:
-                mask = load_mask_image(str(mask_path))
-                preview_cols.append(("Mask", render_mask_rgb(mask, show_ignore=show_ignore)))
-            if image_path and mask_path and show_overlay:
-                image = try_load_frame_image(str(image_path))
-                mask = load_mask_image(str(mask_path))
-                if image is not None:
-                    preview_cols.append(("Overlay", blend_overlay(image, mask, alpha=opacity, show_ignore=show_ignore)))
-            if pred_path and pred_path.exists() and show_prediction:
-                pred_mask = load_mask_image(str(pred_path))
-                preview_cols.append(("Prediction", render_mask_rgb(pred_mask, show_ignore=show_ignore)))
-                if image_path:
-                    pred_base = try_load_frame_image(str(image_path))
-                    if pred_base is not None:
-                        preview_cols.append(("Prediction Overlay", blend_overlay(pred_base, pred_mask, alpha=opacity, show_ignore=show_ignore)))
+            with main_tab:
+                with st.expander("보기 옵션", expanded=True):
+                    opt1, opt2, opt3 = st.columns(3)
+                    show_mask = opt1.checkbox("Mask 보기", value=True)
+                    show_overlay = opt2.checkbox("Overlay 보기", value=False)
+                    show_ignore = opt3.checkbox("Ignore 표시", value=False)
+                    opacity = st.slider("Overlay 투명도", min_value=0.1, max_value=0.9, value=0.35, step=0.05)
 
-            if preview_cols:
-                cols = st.columns(min(4, len(preview_cols)))
-                for idx, (title, img) in enumerate(preview_cols):
-                    cols[idx % len(cols)].image(img, caption=title, use_container_width=True)
-            else:
-                st.info("현재 보기 옵션으로 표시할 미리보기가 없습니다. Mask/Overlay 토글을 켜보세요.")
+                preview_cols = []
+                if image_path and image_path.exists():
+                    image_preview = try_load_frame_image(str(image_path))
+                    if image_preview is not None:
+                        preview_cols.append(("기준 이미지", image_preview))
+                if mask_path and mask_path.exists() and show_mask:
+                    mask = load_mask_image(str(mask_path))
+                    preview_cols.append(("최종 Mask", render_mask_rgb(mask, show_ignore=show_ignore)))
+                if image_path and mask_path and show_overlay:
+                    image = try_load_frame_image(str(image_path))
+                    mask = load_mask_image(str(mask_path))
+                    if image is not None:
+                        preview_cols.append(("Mask Overlay", blend_overlay(image, mask, alpha=opacity, show_ignore=show_ignore)))
+
+                if preview_cols:
+                    cols = st.columns(min(3, len(preview_cols)))
+                    for idx, (title, img) in enumerate(preview_cols):
+                        cols[idx % len(cols)].image(img, caption=title, use_container_width=True)
+                else:
+                    st.info("표시할 기준 이미지 또는 mask가 없습니다.")
+
+            with fume_tab:
+                st.caption("U-Net 2차 전처리로 분리된 Fume 전용 결과를 보여줍니다.")
+                if matched_fume_frame is not None and matched_fume_frame.exists():
+                    fume_img = try_load_frame_image(str(matched_fume_frame))
+                    if fume_img is not None:
+                        st.image(fume_img, caption=f"Fume frame · {matched_fume_frame.name}", use_container_width=True)
+                elif fume_bundle.video_path is not None and fume_bundle.video_path.exists():
+                    st.video(str(fume_bundle.video_path))
+                    st.caption(f"Fume video · {fume_bundle.video_path.name}")
+                elif fume_bundle.frame_paths:
+                    st.info("Fume 프레임 ZIP은 업로드되어 있지만 현재 항목과 같은 이름의 프레임이 없습니다.")
+                    sample_cols = st.columns(min(3, len(fume_bundle.frame_paths[:3])))
+                    for idx, p in enumerate(fume_bundle.frame_paths[:3]):
+                        img = try_load_frame_image(str(p))
+                        if img is not None:
+                            sample_cols[idx].image(img, caption=p.name, use_container_width=True)
+                else:
+                    st.info("업로드된 Fume 결과물이 없습니다.")
+                st.caption(f"연결 정보: {row['fume_output_type']} · {row['fume_output_path'] or '-'}")
+
+            with spatter_tab:
+                st.caption("U-Net 2차 전처리로 분리된 Spatter 전용 결과를 보여줍니다.")
+                if matched_spatter_frame is not None and matched_spatter_frame.exists():
+                    sp_img = try_load_frame_image(str(matched_spatter_frame))
+                    if sp_img is not None:
+                        st.image(sp_img, caption=f"Spatter frame · {matched_spatter_frame.name}", use_container_width=True)
+                elif spatter_bundle.video_path is not None and spatter_bundle.video_path.exists():
+                    st.video(str(spatter_bundle.video_path))
+                    st.caption(f"Spatter video · {spatter_bundle.video_path.name}")
+                elif spatter_bundle.frame_paths:
+                    st.info("Spatter 프레임 ZIP은 업로드되어 있지만 현재 항목과 같은 이름의 프레임이 없습니다.")
+                    sample_cols = st.columns(min(3, len(spatter_bundle.frame_paths[:3])))
+                    for idx, p in enumerate(spatter_bundle.frame_paths[:3]):
+                        img = try_load_frame_image(str(p))
+                        if img is not None:
+                            sample_cols[idx].image(img, caption=p.name, use_container_width=True)
+                else:
+                    st.info("업로드된 Spatter 결과물이 없습니다.")
+                st.caption(f"연결 정보: {row['spatter_output_type']} · {row['spatter_output_path'] or '-'}")
 
             with st.expander("선택 항목의 자동 분석 정보", expanded=False):
                 meta1, meta2 = st.columns(2)
@@ -1300,18 +1686,18 @@ with review_tab:
                         "invalid_values": row["invalid_values"],
                     })
                 with meta2:
-                    st.markdown("**mask 자동 판독 요약**")
+                    st.markdown("**분리 결과 연결 요약**")
                     st.json({
-                        "fume": bool(row["has_fume"]),
-                        "spatter": bool(row["has_spatter"]),
+                        "fume_mask_label": bool(row["has_fume"]),
+                        "spatter_mask_label": bool(row["has_spatter"]),
                         "ignore": bool(row["has_ignore"]),
-                        "empty_mask": bool(row["empty_mask"]),
-                        "ignore_only": bool(row["ignore_only"]),
-                        "prediction": bool(row["has_prediction"]),
+                        "fume_output": row["fume_output_type"],
+                        "spatter_output": row["spatter_output_type"],
                     })
 
+
 with quality_tab:
-    st.subheader("Quality Label")
+    render_specimen_header(registry_df, selected_specimen)
     if not selected_specimen:
         st.info("실험표를 먼저 저장해주세요.")
     else:
@@ -1324,8 +1710,9 @@ with quality_tab:
         st.caption("규칙: 외관 검사 결과 또는 인장 시험 결과 중 하나라도 불량이면 최종 판정은 자동으로 불량입니다.")
         defect_type = st.text_input("불량 유형", value=current_truth.get("defect_type", ""), key=f"label_defect_{selected_specimen}")
         notes = st.text_area("메모", value=current_truth.get("notes", ""), key=f"label_notes_{selected_specimen}")
-        detail_auto = f"{selected_specimen} 시편은 최종 {final_label}입니다. 외관 검사 결과는 {visual_result}, 인장 시험 결과는 {tensile_result}입니다."
-        summary_detail = st.text_area("상세 문장", value=current_truth.get("details", detail_auto), key=f"label_detail_{selected_specimen}")
+        detail_auto = build_quality_detail(selected_specimen, final_label, visual_result, tensile_result, defect_type)
+        st.caption("상세 문장란은 제거하고, 현재 입력값을 바탕으로 자동 요약만 생성되도록 정리했습니다.")
+        st.markdown(f"**자동 요약:** {detail_auto}")
         if st.button("현재 시편 품질 라벨 저장", type="primary"):
             state.setdefault("truth", {})[selected_specimen] = {
                 "final_label": final_label,
@@ -1333,7 +1720,7 @@ with quality_tab:
                 "tensile_result": tensile_result,
                 "defect_type": defect_type,
                 "notes": notes,
-                "details": summary_detail,
+                "details": detail_auto,
                 "reviewed": reviewed,
             }
             persist_state(project_root, state)
@@ -1353,7 +1740,9 @@ with quality_tab:
                 ]
                 if "reviewed" not in edit_df.columns:
                     edit_df["reviewed"] = [bool(state.get("truth", {}).get(sid, {}).get("reviewed", False)) for sid in edit_df["specimen_id"]]
-                st.caption("final_label은 외관 검사 결과 / 인장 시험 결과에 따라 자동 계산됩니다. 저장 시 수동 입력값이 있더라도 자동 규칙이 우선합니다.")
+                if "summary_detail" in edit_df.columns:
+                    edit_df = edit_df.drop(columns=["summary_detail"])
+                st.caption("final_label은 외관 검사 결과 / 인장 시험 결과에 따라 자동 계산됩니다. 저장 시 수동 입력값이 있더라도 자동 규칙이 우선하며, 상세 문장은 자동 요약으로 생성됩니다.")
                 edited = st.data_editor(edit_df, use_container_width=True, num_rows="fixed")
                 if st.button("표 편집 내용 저장"):
                     truth = {}
@@ -1361,13 +1750,15 @@ with quality_tab:
                         sid = str(row["specimen_id"])
                         visual_result = row.get("visual_result", "")
                         tensile_result = row.get("tensile_result", "")
+                        defect_type = row.get("defect_type", "")
+                        final_label = auto_final_label(visual_result, tensile_result, row.get("final_label", "미입력"))
                         truth[sid] = {
-                            "final_label": auto_final_label(visual_result, tensile_result, row.get("final_label", "미입력")),
+                            "final_label": final_label,
                             "visual_result": visual_result,
                             "tensile_result": tensile_result,
-                            "defect_type": row.get("defect_type", ""),
+                            "defect_type": defect_type,
                             "notes": row.get("notes", ""),
-                            "details": row.get("summary_detail", ""),
+                            "details": build_quality_detail(sid, final_label, visual_result, tensile_result, defect_type),
                             "reviewed": bool(row.get("reviewed", False)),
                         }
                     state["truth"] = truth
@@ -1375,7 +1766,7 @@ with quality_tab:
                     st.success("일괄 저장되었습니다.")
 
 with tools_tab:
-    st.subheader(f"Tools · {selected_specimen_display or '-'}")
+    render_specimen_header(registry_df, selected_specimen)
     if not selected_specimen:
         st.info("실험표를 먼저 저장해주세요.")
     else:
@@ -1402,7 +1793,7 @@ with tools_tab:
 
             with st.expander("자동 매칭 상세표", expanded=False):
                 st.dataframe(
-                    dataset_df[["item_id", "status", "has_fume", "has_spatter", "has_ignore", "size_match", "invalid_values", "quality_label", "reviewed"]],
+                    dataset_df[["item_id", "status", "has_fume", "has_spatter", "has_ignore", "has_fume_output", "has_spatter_output", "fume_output_type", "spatter_output_type", "size_match", "invalid_values", "quality_label", "reviewed"]],
                     use_container_width=True,
                     height=260,
                 )
@@ -1414,7 +1805,8 @@ with tools_tab:
                     "ignore 포함": int(dataset_df["has_ignore"].sum()),
                     "empty mask": int(dataset_df["empty_mask"].sum()),
                     "ignore only": int(dataset_df["ignore_only"].sum()),
-                    "prediction 존재": int(dataset_df["has_prediction"].sum()),
+                    "fume 결과 연결": int(dataset_df["has_fume_output"].sum()),
+                    "spatter 결과 연결": int(dataset_df["has_spatter_output"].sum()),
                 }
                 st.json(class_summary)
 
@@ -1423,12 +1815,11 @@ with tools_tab:
                 st.download_button("현재 시편 dataset CSV 다운로드", data=csv_bytes, file_name=f"{selected_specimen}_dataset_manifest.csv", mime="text/csv")
 
 with export_tab:
-    st.subheader("Export")
     truth_df = build_truth_dataframe(state)
     if truth_df.empty:
         st.info("실험표를 먼저 저장해주세요.")
     else:
-        st.caption("검토/추출 전용입니다. 입력/수정은 Quality Label 탭에서 진행하세요.")
+        st.caption("검토/추출 전용입니다. 입력/수정은 Quality Label 탭에서 진행하세요. handoff 패키지에는 전체 CSV와 함께 시편별 시트로 분리된 dataset_manifest_all.xlsx가 포함되며, Fume/Spatter 결과물 경로와 존재 여부도 함께 기록됩니다.")
         for _, row in truth_df.iterrows():
             sid = row["specimen_id"]
             reviewed = bool(state.get("truth", {}).get(sid, {}).get("reviewed", False))
@@ -1438,9 +1829,11 @@ with export_tab:
                 st.write(f"**인장 시험:** {row.get('tensile_result', '') or '미입력'}")
                 st.write(f"**결함 유형:** {row.get('defect_type', '') or '-'}")
                 st.write(f"**메모:** {row.get('notes', '') or '-'}")
-                st.write(f"**상세 문장:** {row.get('summary_detail', '') or '-'}")
+                st.write(f"**자동 요약:** {row.get('summary_detail', '') or '-'}")
                 specimen_dataset = build_dataset_rows(project_root, sid, state)
                 st.write(f"**매칭 완료:** {int((specimen_dataset['status'] == 'ready').sum()) if not specimen_dataset.empty else 0} / {len(specimen_dataset)}")
+                st.write(f"**Fume 결과 연결:** {int(specimen_dataset['has_fume_output'].sum()) if not specimen_dataset.empty else 0}")
+                st.write(f"**Spatter 결과 연결:** {int(specimen_dataset['has_spatter_output'].sum()) if not specimen_dataset.empty else 0}")
         if st.button("handoff 패키지 추출"):
             zip_path = export_handoff(project_root, state)
             st.success(f"추출 완료: {zip_path.name}")
