@@ -1458,6 +1458,41 @@ def persist_state(project_root: Path, state: Dict[str, Any]) -> None:
     save_state(project_root, state)
 
 
+def rename_project_dir(projects_root: Path, old_name: str, new_name: str) -> Tuple[bool, str, Optional[Path]]:
+    old_name = str(old_name or "").strip()
+    new_name = str(new_name or "").strip()
+    if not old_name:
+        return False, "이름을 바꿀 프로젝트를 먼저 선택해주세요.", None
+    if not new_name:
+        return False, "새 프로젝트 이름을 입력해주세요.", None
+    if old_name == new_name:
+        return False, "기존 이름과 새 이름이 같습니다.", None
+    src_path = projects_root / old_name
+    dst_path = projects_root / new_name
+    if not src_path.exists() or not src_path.is_dir():
+        return False, "선택한 프로젝트 폴더를 찾을 수 없습니다.", None
+    if dst_path.exists():
+        return False, "같은 이름의 프로젝트가 이미 존재합니다.", None
+    try:
+        src_path.rename(dst_path)
+    except Exception as e:
+        return False, f"이름 변경 중 오류가 발생했습니다: {e}", None
+    return True, f"프로젝트 이름이 '{old_name}' → '{new_name}' 로 변경되었습니다.", dst_path
+
+
+def delete_project_dir(projects_root: Path, project_name: str) -> Tuple[bool, str]:
+    project_name = str(project_name or "").strip()
+    if not project_name:
+        return False, "삭제할 프로젝트를 먼저 선택해주세요."
+    target = projects_root / project_name
+    if not target.exists() or not target.is_dir():
+        return False, "선택한 프로젝트 폴더를 찾을 수 없습니다."
+    try:
+        shutil.rmtree(target)
+    except Exception as e:
+        return False, f"프로젝트 삭제 중 오류가 발생했습니다: {e}"
+    return True, f"프로젝트 '{project_name}' 를 삭제했습니다."
+
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
@@ -1471,9 +1506,16 @@ with st.sidebar:
     st.session_state["projects_root"] = str(projects_root)
 
     existing_projects = sorted([p.name for p in projects_root.iterdir() if p.is_dir()])
+    active_project_root = st.session_state.get("active_project_root")
+    active_project_name = Path(active_project_root).name if active_project_root else ""
+    pending_open_project = st.session_state.pop("pending_selected_project_name", None)
+    pending_manage_project = st.session_state.pop("pending_manage_project_name", None)
+
     project_mode = st.radio("작업 방식", ["기존 프로젝트 열기", "새 프로젝트 만들기"], key="project_mode")
     if project_mode == "기존 프로젝트 열기" and existing_projects:
-        selected_project_name = st.selectbox("프로젝트 선택", existing_projects, key="selected_project_name")
+        open_default_name = pending_open_project or (active_project_name if active_project_name in existing_projects else existing_projects[0])
+        open_default_index = existing_projects.index(open_default_name) if open_default_name in existing_projects else 0
+        selected_project_name = st.selectbox("프로젝트 선택", existing_projects, key="selected_project_name", index=open_default_index)
     else:
         selected_project_name = st.text_input("새 프로젝트 이름", value=st.session_state.get("new_project_name", "schlieren_project"), key="new_project_name")
 
@@ -1493,8 +1535,67 @@ with st.sidebar:
             st.success(f"프로젝트 준비 완료: {project_root.name}")
 
     active_project_root = st.session_state.get("active_project_root")
+    active_project_name = Path(active_project_root).name if active_project_root else ""
     if active_project_root:
-        st.info(f"현재 프로젝트: {Path(active_project_root).name}")
+        st.info(f"현재 프로젝트: {active_project_name}")
+
+    if existing_projects:
+        st.markdown("---")
+        with st.expander("프로젝트 관리", expanded=False):
+            manage_default_name = pending_manage_project or (active_project_name if active_project_name in existing_projects else existing_projects[0])
+            manage_default_index = existing_projects.index(manage_default_name) if manage_default_name in existing_projects else 0
+            manage_project = st.selectbox(
+                "관리할 프로젝트",
+                existing_projects,
+                key="manage_project_name",
+                index=manage_default_index,
+            )
+            rename_value = st.text_input(
+                "새 프로젝트 이름",
+                value=manage_project,
+                key=f"rename_project_value__{manage_project}",
+                help="기존 프로젝트 폴더 이름을 바꿉니다.",
+            )
+            if st.button("프로젝트 이름 변경", key="rename_project_btn"):
+                ok, msg, new_path = rename_project_dir(projects_root, manage_project, rename_value)
+                if ok and new_path is not None:
+                    if active_project_root and Path(active_project_root).name == manage_project:
+                        st.session_state["active_project_root"] = str(new_path)
+                        st.session_state["project_state"] = load_state(new_path)
+                    st.session_state["pending_selected_project_name"] = new_path.name
+                    st.session_state["pending_manage_project_name"] = new_path.name
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+            st.caption("삭제는 되돌릴 수 없습니다. 아래 칸에 프로젝트 이름을 정확히 입력해야 삭제됩니다.")
+            delete_confirm = st.text_input(
+                "삭제 확인용 프로젝트 이름 입력",
+                value="",
+                key="delete_project_confirm",
+                placeholder=manage_project,
+            )
+            if st.button("프로젝트 삭제", key="delete_project_btn"):
+                if delete_confirm.strip() != manage_project:
+                    st.error("삭제 확인을 위해 프로젝트 이름을 정확히 입력해주세요.")
+                else:
+                    ok, msg = delete_project_dir(projects_root, manage_project)
+                    if ok:
+                        if active_project_root and Path(active_project_root).name == manage_project:
+                            st.session_state.pop("active_project_root", None)
+                            st.session_state.pop("project_state", None)
+                        remaining_projects = sorted([p.name for p in projects_root.iterdir() if p.is_dir()])
+                        if remaining_projects:
+                            st.session_state["pending_selected_project_name"] = remaining_projects[0]
+                            st.session_state["pending_manage_project_name"] = remaining_projects[0]
+                        else:
+                            st.session_state.pop("pending_selected_project_name", None)
+                            st.session_state.pop("pending_manage_project_name", None)
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
 
 if "active_project_root" not in st.session_state:
     st.warning("왼쪽 사이드바에서 프로젝트를 먼저 열어주세요.")
