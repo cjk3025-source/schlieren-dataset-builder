@@ -20,7 +20,8 @@ from streamlit_drawable_canvas import st_canvas
 APP_TITLE = "BOS Schlieren Label Review Studio"
 DEFAULT_PROJECTS_ROOT = str(Path.cwd() / "projects")
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
-VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".mpg", ".mpeg"}
+VIDEO_EXTS = {".mp4", ".avi"}
+VIDEO_MIME_TYPES = {".mp4": "video/mp4", ".avi": "video/x-msvideo"}
 
 
 def ensure_dir(path: Path) -> Path:
@@ -492,6 +493,29 @@ def load_frame_image(path_str: str) -> np.ndarray:
     img = Image.open(path)
     img = ImageOps.exif_transpose(img).convert("RGB")
     return np.array(img)
+
+@st.cache_data(show_spinner=False)
+def load_video_bytes(path_str: str) -> bytes:
+    path = Path(path_str)
+    return path.read_bytes()
+
+
+def render_video_file(video_path: Path, caption: str = "") -> None:
+    if video_path is None or not video_path.exists() or not video_path.is_file():
+        st.info("영상 파일을 찾을 수 없습니다.")
+        return
+    suffix = video_path.suffix.lower()
+    mime = VIDEO_MIME_TYPES.get(suffix, "video/mp4")
+    try:
+        video_bytes = load_video_bytes(str(video_path))
+        st.video(video_bytes, format=mime)
+        if caption:
+            st.caption(caption)
+        if suffix == ".avi":
+            st.caption("AVI는 허용되지만 브라우저 환경에 따라 재생 호환성이 MP4보다 낮을 수 있습니다.")
+    except Exception as exc:
+        st.warning(f"영상 표시 중 오류가 발생했습니다: {exc}")
+        st.caption(f"파일 경로: {video_path}")
 
 
 def try_load_frame_image(path_str: str) -> Optional[np.ndarray]:
@@ -1391,13 +1415,13 @@ with upload_tab:
         fume_bundle = load_result_bundle(fume_dir)
         spatter_bundle = load_result_bundle(spatter_dir)
         st.caption("권장 포맷: 전처리 이미지 파일명과 mask 파일명 stem 일치 (예: sample_001.jpg ↔ sample_001.png). Mask PNG 값은 background=0, fume=1, spatter=2, ignore=3 을 권장합니다.")
-        st.info("전처리 이미지 업로드는 rule-based 1차 전처리까지 끝난 기준 이미지 ZIP 1개만 받습니다. 여기에 더해 2차 전처리(U-Net) 결과물은 Fume 전용과 Spatter 전용으로 각각 따로 업로드합니다. ZIP(프레임 묶음) 또는 영상 1개를 시편 단위로 적용하면 기존 데이터는 해당 종류만 교체됩니다.")
+        st.info("전처리 이미지 업로드는 rule-based 1차 전처리까지 끝난 기준 이미지 ZIP 1개만 받습니다. 여기에 더해 2차 전처리(U-Net) 결과물은 Fume 전용과 Spatter 전용으로 각각 따로 업로드합니다. ZIP(프레임 묶음) 또는 영상 1개(mp4 또는 avi)를 시편 단위로 적용하면 기존 데이터는 해당 종류만 교체됩니다.")
 
         with st.expander("업로드 항목 설명", expanded=False):
             st.markdown("- **전처리 이미지 업로드**: OpenCV/Python rule-based 1차 전처리 후 LabelMe 라벨링에 사용한 기준 이미지 ZIP")
             st.markdown("- **최종 Mask PNG 업로드**: 사람이 최종 확정한 mask PNG. 전처리 이미지와 파일명 stem이 1:1로 맞아야 합니다.")
-            st.markdown("- **Fume 결과물 업로드**: U-Net 2차 전처리로 분리된 흄 전용 결과물. ZIP(프레임) 또는 영상 1개를 업로드합니다.")
-            st.markdown("- **Spatter 결과물 업로드**: U-Net 2차 전처리로 분리된 스패터 전용 결과물. ZIP(프레임) 또는 영상 1개를 업로드합니다.")
+            st.markdown("- **Fume 결과물 업로드**: U-Net 2차 전처리로 분리된 흄 전용 결과물. ZIP(프레임) 또는 영상 1개(mp4 또는 avi)를 업로드합니다.")
+            st.markdown("- **Spatter 결과물 업로드**: U-Net 2차 전처리로 분리된 스패터 전용 결과물. ZIP(프레임) 또는 영상 1개(mp4 또는 avi)를 업로드합니다.")
 
         flash_key = f"upload_flash_{selected_specimen}"
         flash_message = st.session_state.pop(flash_key, None)
@@ -1453,7 +1477,7 @@ with upload_tab:
             up_fume = st.file_uploader(
                 "Fume 결과물 업로드 (ZIP 또는 영상)",
                 accept_multiple_files=False,
-                type=["zip", "mp4", "avi", "mov", "mkv", "wmv", "mpg", "mpeg"],
+                type=["zip", "mp4", "avi"],
                 key=f"fume_result_{selected_specimen}_{st.session_state[fume_nonce_key]}",
             )
             if up_fume is not None:
@@ -1474,7 +1498,7 @@ with upload_tab:
             up_spatter = st.file_uploader(
                 "Spatter 결과물 업로드 (ZIP 또는 영상)",
                 accept_multiple_files=False,
-                type=["zip", "mp4", "avi", "mov", "mkv", "wmv", "mpg", "mpeg"],
+                type=["zip", "mp4", "avi"],
                 key=f"spatter_result_{selected_specimen}_{st.session_state[spatter_nonce_key]}",
             )
             if up_spatter is not None:
@@ -1640,8 +1664,7 @@ with review_tab:
                     if fume_img is not None:
                         st.image(fume_img, caption=f"Fume frame · {matched_fume_frame.name}", use_container_width=True)
                 elif fume_bundle.video_path is not None and fume_bundle.video_path.exists():
-                    st.video(str(fume_bundle.video_path))
-                    st.caption(f"Fume video · {fume_bundle.video_path.name}")
+                    render_video_file(fume_bundle.video_path, caption=f"Fume video · {fume_bundle.video_path.name}")
                 elif fume_bundle.frame_paths:
                     st.info("Fume 프레임 ZIP은 업로드되어 있지만 현재 항목과 같은 이름의 프레임이 없습니다.")
                     sample_cols = st.columns(min(3, len(fume_bundle.frame_paths[:3])))
@@ -1660,8 +1683,7 @@ with review_tab:
                     if sp_img is not None:
                         st.image(sp_img, caption=f"Spatter frame · {matched_spatter_frame.name}", use_container_width=True)
                 elif spatter_bundle.video_path is not None and spatter_bundle.video_path.exists():
-                    st.video(str(spatter_bundle.video_path))
-                    st.caption(f"Spatter video · {spatter_bundle.video_path.name}")
+                    render_video_file(spatter_bundle.video_path, caption=f"Spatter video · {spatter_bundle.video_path.name}")
                 elif spatter_bundle.frame_paths:
                     st.info("Spatter 프레임 ZIP은 업로드되어 있지만 현재 항목과 같은 이름의 프레임이 없습니다.")
                     sample_cols = st.columns(min(3, len(spatter_bundle.frame_paths[:3])))
