@@ -1,6 +1,7 @@
 import io
 import json
 import math
+import base64
 import os
 import shutil
 import zipfile
@@ -14,6 +15,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 from streamlit_drawable_canvas import st_canvas
 
@@ -21,6 +23,7 @@ APP_TITLE = "BOS Schlieren Label Review Studio"
 DEFAULT_PROJECTS_ROOT = str(Path.cwd() / "projects")
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 VIDEO_EXTS = {".mp4", ".avi"}
+PREVIEW_VIDEO_NAME = "_browser_preview.mp4"
 VIDEO_MIME_TYPES = {".mp4": "video/mp4", ".avi": "video/x-msvideo"}
 
 
@@ -494,29 +497,6 @@ def load_frame_image(path_str: str) -> np.ndarray:
     img = ImageOps.exif_transpose(img).convert("RGB")
     return np.array(img)
 
-@st.cache_data(show_spinner=False)
-def load_video_bytes(path_str: str) -> bytes:
-    path = Path(path_str)
-    return path.read_bytes()
-
-
-def render_video_file(video_path: Path, caption: str = "") -> None:
-    if video_path is None or not video_path.exists() or not video_path.is_file():
-        st.info("영상 파일을 찾을 수 없습니다.")
-        return
-    suffix = video_path.suffix.lower()
-    mime = VIDEO_MIME_TYPES.get(suffix, "video/mp4")
-    try:
-        video_bytes = load_video_bytes(str(video_path))
-        st.video(video_bytes, format=mime)
-        if caption:
-            st.caption(caption)
-        if suffix == ".avi":
-            st.caption("AVI는 허용되지만 브라우저 환경에 따라 재생 호환성이 MP4보다 낮을 수 있습니다.")
-    except Exception as exc:
-        st.warning(f"영상 표시 중 오류가 발생했습니다: {exc}")
-        st.caption(f"파일 경로: {video_path}")
-
 
 def try_load_frame_image(path_str: str) -> Optional[np.ndarray]:
     path = Path(path_str)
@@ -808,10 +788,221 @@ def specimen_spatter_result_dir(project_root: Path, specimen_id: str) -> Path:
     return ensure_dir(get_project_paths(project_root)["processed"] / specimen_id / "spatter_result")
 
 
+def result_video_preview_path(target_dir: Path) -> Path:
+    return target_dir / PREVIEW_VIDEO_NAME
+
+
+def get_video_mime_type(path: Optional[Path]) -> str:
+    if path is None:
+        return "video/mp4"
+    return VIDEO_MIME_TYPES.get(path.suffix.lower(), "video/mp4")
+
+
+def ensure_browser_playable_video(source_path: Path, target_dir: Path) -> Optional[Path]:
+    if source_path is None or not source_path.exists():
+        return None
+    preview_path = result_video_preview_path(target_dir)
+    try:
+        if preview_path.exists() and preview_path.stat().st_mtime >= source_path.stat().st_mtime and preview_path.stat().st_size > 0:
+            return preview_path
+    except Exception:
+        pass
+
+    cap = None
+    writer = None
+    try:
+        if preview_path.exists():
+            preview_path.unlink(missing_ok=True)
+        cap = cv2.VideoCapture(str(source_path))
+        if not cap.isOpened():
+            raise RuntimeError("video_open_failed")
+
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        if not fps or fps <= 0 or fps > 240:
+            fps = 20.0
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+
+        if width <= 0 or height <= 0:
+            ok, first_frame = cap.read()
+            if not ok or first_frame is None:
+                raise RuntimeError("video_first_frame_failed")
+            height, width = first_frame.shape[:2]
+            cap.release()
+            cap = cv2.VideoCapture(str(source_path))
+            if not cap.isOpened():
+                raise RuntimeError("video_reopen_failed")
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(preview_path), fourcc, fps, (width, height))
+        if not writer.isOpened():
+            raise RuntimeError("video_writer_open_failed")
+
+        wrote = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            if frame.ndim == 2:
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            elif len(frame.shape) == 3 and frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            writer.write(frame)
+            wrote += 1
+
+        if wrote > 0:
+            writer.release()
+            writer = None
+            cap.release()
+            cap = None
+            if preview_path.exists() and preview_path.stat().st_size > 0:
+                return preview_path
+        raise RuntimeError("video_preview_empty")
+    except Exception:
+        try:
+            if writer is not None:
+                writer.release()
+        except Exception:
+            pass
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            pass
+        try:
+            if source_path.suffix.lower() == ".mp4":
+                shutil.copy2(source_path, preview_path)
+                if preview_path.exists() and preview_path.stat().st_size > 0:
+                    return preview_path
+        except Exception:
+            pass
+        return source_path
+
+
+def get_review_video_path(bundle: ResultBundle) -> Optional[Path]:
+    if bundle.video_path is None or not bundle.video_path.exists():
+        return None
+    preview_path = ensure_browser_playable_video(bundle.video_path, bundle.root_dir)
+    if preview_path is not None and preview_path.exists():
+        return preview_path
+    return bundle.video_path if bundle.video_path.exists() else None
+
+
+@st.cache_data(show_spinner=False)
+def load_binary_blob(path_str: str) -> bytes:
+    return Path(path_str).read_bytes()
+
+
+def render_video_blob(path: Optional[Path], label: str) -> bool:
+    if path is None or not path.exists():
+        return False
+    try:
+        video_bytes = load_binary_blob(str(path))
+        st.video(video_bytes, format=get_video_mime_type(path))
+        st.caption(f"{label} · {path.name}")
+        return True
+    except Exception as exc:
+        st.warning(f"영상 미리보기를 불러오지 못했습니다: {exc}")
+        return False
+
+
+@st.cache_data(show_spinner=False)
+def sample_video_preview_frames(path_str: str, max_frames: int = 120, target_width: int = 960) -> Dict[str, Any]:
+    path = Path(path_str)
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return {"frames": [], "fps": 10.0}
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if not fps or fps <= 0 or fps > 240:
+        fps = 20.0
+    step = max(1, math.ceil(total / max_frames)) if total else 1
+    encoded_frames: List[str] = []
+    idx = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            if idx % step == 0:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w = frame.shape[:2]
+                if w > target_width:
+                    scale = target_width / float(w)
+                    frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+                ok_jpg, buf = cv2.imencode('.jpg', cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                if ok_jpg:
+                    encoded_frames.append(base64.b64encode(buf.tobytes()).decode('ascii'))
+            idx += 1
+    finally:
+        cap.release()
+    preview_fps = max(1.0, min(20.0, fps / step))
+    return {"frames": encoded_frames, "fps": preview_fps}
+
+
+def render_video_preview_player(path: Optional[Path], label: str) -> bool:
+    if path is None or not path.exists():
+        return False
+    preview = sample_video_preview_frames(str(path))
+    frames = preview.get("frames", [])
+    fps = float(preview.get("fps", 10.0) or 10.0)
+    if not frames:
+        return False
+    html_frames = json.dumps(frames)
+    html = f"""
+    <div style="border:1px solid #ddd;border-radius:10px;padding:10px;background:#fafafa">
+      <div style="font-size:0.95rem;margin-bottom:8px;color:#444">{escape(label)} · {escape(path.name)} · sampled preview</div>
+      <img id="videoFrame" src="data:image/jpeg;base64,{{frames[0]}}" style="width:100%;max-width:960px;border-radius:8px;display:block;margin-bottom:8px;" />
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button id="playBtn" style="padding:4px 10px">Play</button>
+        <button id="pauseBtn" style="padding:4px 10px">Pause</button>
+        <input id="frameSlider" type="range" min="0" max="{{len(frames)-1}}" value="0" style="flex:1;min-width:180px" />
+        <span id="frameInfo" style="font-size:0.9rem;color:#666">1 / {{len(frames)}}</span>
+      </div>
+    </div>
+    <script>
+      const frames = {html_frames};
+      const fps = {fps};
+      const img = document.getElementById('videoFrame');
+      const slider = document.getElementById('frameSlider');
+      const info = document.getElementById('frameInfo');
+      const playBtn = document.getElementById('playBtn');
+      const pauseBtn = document.getElementById('pauseBtn');
+      let current = 0;
+      let timer = null;
+      function render(i) {{
+        current = Math.max(0, Math.min(i, frames.length - 1));
+        img.src = 'data:image/jpeg;base64,' + frames[current];
+        slider.value = current;
+        info.textContent = `${{current + 1}} / ${{frames.length}}`;
+      }}
+      function start() {{
+        if (timer || frames.length <= 1) return;
+        timer = setInterval(() => {{
+          current = (current + 1) % frames.length;
+          render(current);
+        }}, 1000 / fps);
+      }}
+      function stop() {{
+        if (timer) {{ clearInterval(timer); timer = null; }}
+      }}
+      slider.addEventListener('input', (e) => {{ stop(); render(parseInt(e.target.value)); }});
+      playBtn.addEventListener('click', start);
+      pauseBtn.addEventListener('click', stop);
+      render(0);
+    </script>
+    """
+    components.html(html, height=620)
+    return True
+
+
 def load_result_bundle(target_dir: Path) -> ResultBundle:
     ensure_dir(target_dir)
     frame_paths = sorted([p for p in target_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMG_EXTS])
-    video_path = next((p for p in sorted(target_dir.rglob("*")) if p.is_file() and p.suffix.lower() in VIDEO_EXTS), None)
+    video_candidates = sorted([p for p in target_dir.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTS])
+    non_preview_videos = [p for p in video_candidates if p.name != PREVIEW_VIDEO_NAME]
+    video_path = non_preview_videos[0] if non_preview_videos else (video_candidates[0] if video_candidates else None)
     if frame_paths:
         mode = "frames"
     elif video_path is not None:
@@ -848,8 +1039,17 @@ def replace_uploaded_result_bundle(uploaded_file: Any, target_dir: Path) -> Dict
                         count += 1
         return {"mode": "frames", "count": count, "name": Path(uploaded_file.name).name}
     if suffix in VIDEO_EXTS:
-        save_uploaded_file(uploaded_file, target_dir / Path(uploaded_file.name).name)
-        return {"mode": "video", "count": 1, "name": Path(uploaded_file.name).name}
+        saved_path = target_dir / Path(uploaded_file.name).name
+        save_uploaded_file(uploaded_file, saved_path)
+        preview_path = ensure_browser_playable_video(saved_path, target_dir)
+        preview_ready = bool(preview_path and preview_path.exists())
+        return {
+            "mode": "video",
+            "count": 1,
+            "name": Path(uploaded_file.name).name,
+            "preview_ready": preview_ready,
+            "preview_name": preview_path.name if preview_ready else "",
+        }
     return {"mode": "unsupported", "count": 0, "name": Path(uploaded_file.name).name}
 
 
@@ -1415,13 +1615,13 @@ with upload_tab:
         fume_bundle = load_result_bundle(fume_dir)
         spatter_bundle = load_result_bundle(spatter_dir)
         st.caption("권장 포맷: 전처리 이미지 파일명과 mask 파일명 stem 일치 (예: sample_001.jpg ↔ sample_001.png). Mask PNG 값은 background=0, fume=1, spatter=2, ignore=3 을 권장합니다.")
-        st.info("전처리 이미지 업로드는 rule-based 1차 전처리까지 끝난 기준 이미지 ZIP 1개만 받습니다. 여기에 더해 2차 전처리(U-Net) 결과물은 Fume 전용과 Spatter 전용으로 각각 따로 업로드합니다. ZIP(프레임 묶음) 또는 영상 1개(mp4 또는 avi)를 시편 단위로 적용하면 기존 데이터는 해당 종류만 교체됩니다.")
+        st.info("전처리 이미지 업로드는 rule-based 1차 전처리까지 끝난 기준 이미지 ZIP 1개만 받습니다. 여기에 더해 2차 전처리(U-Net) 결과물은 Fume 전용과 Spatter 전용으로 각각 따로 업로드합니다. ZIP(프레임 묶음) 또는 영상 1개를 시편 단위로 적용하면 기존 데이터는 해당 종류만 교체됩니다.")
 
         with st.expander("업로드 항목 설명", expanded=False):
             st.markdown("- **전처리 이미지 업로드**: OpenCV/Python rule-based 1차 전처리 후 LabelMe 라벨링에 사용한 기준 이미지 ZIP")
             st.markdown("- **최종 Mask PNG 업로드**: 사람이 최종 확정한 mask PNG. 전처리 이미지와 파일명 stem이 1:1로 맞아야 합니다.")
-            st.markdown("- **Fume 결과물 업로드**: U-Net 2차 전처리로 분리된 흄 전용 결과물. ZIP(프레임) 또는 영상 1개(mp4 또는 avi)를 업로드합니다.")
-            st.markdown("- **Spatter 결과물 업로드**: U-Net 2차 전처리로 분리된 스패터 전용 결과물. ZIP(프레임) 또는 영상 1개(mp4 또는 avi)를 업로드합니다.")
+            st.markdown("- **Fume 결과물 업로드**: U-Net 2차 전처리로 분리된 흄 전용 결과물. ZIP(프레임) 또는 영상 1개를 업로드합니다.")
+            st.markdown("- **Spatter 결과물 업로드**: U-Net 2차 전처리로 분리된 스패터 전용 결과물. ZIP(프레임) 또는 영상 1개를 업로드합니다.")
 
         flash_key = f"upload_flash_{selected_specimen}"
         flash_message = st.session_state.pop(flash_key, None)
@@ -1489,7 +1689,7 @@ with upload_tab:
                     if result["mode"] == "frames":
                         st.session_state[flash_key] = f"Fume 결과물 저장 완료: {result['count']}장"
                     elif result["mode"] == "video":
-                        st.session_state[flash_key] = f"Fume 결과물 저장 완료: {result['name']}"
+                        st.session_state[flash_key] = f"Fume 결과물 저장 완료: {result['name']} (브라우저 재생본 준비={result.get('preview_ready', False)})"
                     else:
                         st.session_state[flash_key] = "Fume 결과물 형식을 확인해주세요."
                     st.session_state[fume_nonce_key] += 1
@@ -1510,7 +1710,7 @@ with upload_tab:
                     if result["mode"] == "frames":
                         st.session_state[flash_key] = f"Spatter 결과물 저장 완료: {result['count']}장"
                     elif result["mode"] == "video":
-                        st.session_state[flash_key] = f"Spatter 결과물 저장 완료: {result['name']}"
+                        st.session_state[flash_key] = f"Spatter 결과물 저장 완료: {result['name']} (브라우저 재생본 준비={result.get('preview_ready', False)})"
                     else:
                         st.session_state[flash_key] = "Spatter 결과물 형식을 확인해주세요."
                     st.session_state[spatter_nonce_key] += 1
@@ -1598,7 +1798,7 @@ with review_tab:
             s2.metric("매칭 완료", int((filtered["status"] == "ready").sum()))
             s3.metric("문제 항목", int(((filtered["status"] != "ready") | (~filtered["size_match"]) | (filtered["invalid_values"] != "") | (filtered["empty_mask"]) | (filtered["ignore_only"])).sum()))
             s4.metric("미검토", int(((filtered["quality_label"] == "미입력") | (~filtered["reviewed"])).sum()))
-            st.caption("Review 탭에서는 선택한 항목에 대해 기준 이미지, Fume 분리 결과, Spatter 분리 결과를 가볍게 확인합니다. 상세 자동 점검표는 Tools 탭에서 확인할 수 있습니다.")
+            st.caption("Review 탭에서는 선택한 항목의 기준 이미지와 최종 mask만 가볍게 확인합니다. 상세 자동 점검표는 Tools 탭에서 확인할 수 있습니다.")
 
             item_ids = filtered["item_id"].tolist() or dataset_df["item_id"].tolist()
             item_id = st.selectbox("검토할 항목", item_ids)
@@ -1606,8 +1806,6 @@ with review_tab:
             image_path = None
             mask_path = None
             assets = specimen_assets(project_root, selected_specimen)
-            fume_bundle = load_result_bundle(specimen_fume_result_dir(project_root, selected_specimen))
-            spatter_bundle = load_result_bundle(specimen_spatter_result_dir(project_root, selected_specimen))
             for p in assets.frame_paths:
                 if p.stem == item_id:
                     image_path = p
@@ -1615,8 +1813,6 @@ with review_tab:
             candidate_mask = specimen_mask_dir(project_root, selected_specimen) / f"{item_id}.png"
             if candidate_mask.exists():
                 mask_path = candidate_mask
-            matched_fume_frame = find_result_frame(fume_bundle, item_id)
-            matched_spatter_frame = find_result_frame(spatter_bundle, item_id)
 
             badge_parts = [f"status={row['status']}"]
             if row["quality_label"] != "미입력":
@@ -1626,74 +1822,33 @@ with review_tab:
             badge_parts.append(f"spatter_output={row['spatter_output_type']}")
             st.markdown(" · ".join(badge_parts))
 
-            main_tab, fume_tab, spatter_tab = st.tabs(["기준 이미지 / Mask", "Fume 결과", "Spatter 결과"])
+            with st.expander("보기 옵션", expanded=True):
+                opt1, opt2, opt3 = st.columns(3)
+                show_mask = opt1.checkbox("Mask 보기", value=True)
+                show_overlay = opt2.checkbox("Overlay 보기", value=False)
+                show_ignore = opt3.checkbox("Ignore 표시", value=False)
+                opacity = st.slider("Overlay 투명도", min_value=0.1, max_value=0.9, value=0.35, step=0.05)
 
-            with main_tab:
-                with st.expander("보기 옵션", expanded=True):
-                    opt1, opt2, opt3 = st.columns(3)
-                    show_mask = opt1.checkbox("Mask 보기", value=True)
-                    show_overlay = opt2.checkbox("Overlay 보기", value=False)
-                    show_ignore = opt3.checkbox("Ignore 표시", value=False)
-                    opacity = st.slider("Overlay 투명도", min_value=0.1, max_value=0.9, value=0.35, step=0.05)
+            preview_cols = []
+            if image_path and image_path.exists():
+                image_preview = try_load_frame_image(str(image_path))
+                if image_preview is not None:
+                    preview_cols.append(("기준 이미지", image_preview))
+            if mask_path and mask_path.exists() and show_mask:
+                mask = load_mask_image(str(mask_path))
+                preview_cols.append(("최종 Mask", render_mask_rgb(mask, show_ignore=show_ignore)))
+            if image_path and mask_path and show_overlay:
+                image = try_load_frame_image(str(image_path))
+                mask = load_mask_image(str(mask_path))
+                if image is not None:
+                    preview_cols.append(("Mask Overlay", blend_overlay(image, mask, alpha=opacity, show_ignore=show_ignore)))
 
-                preview_cols = []
-                if image_path and image_path.exists():
-                    image_preview = try_load_frame_image(str(image_path))
-                    if image_preview is not None:
-                        preview_cols.append(("기준 이미지", image_preview))
-                if mask_path and mask_path.exists() and show_mask:
-                    mask = load_mask_image(str(mask_path))
-                    preview_cols.append(("최종 Mask", render_mask_rgb(mask, show_ignore=show_ignore)))
-                if image_path and mask_path and show_overlay:
-                    image = try_load_frame_image(str(image_path))
-                    mask = load_mask_image(str(mask_path))
-                    if image is not None:
-                        preview_cols.append(("Mask Overlay", blend_overlay(image, mask, alpha=opacity, show_ignore=show_ignore)))
-
-                if preview_cols:
-                    cols = st.columns(min(3, len(preview_cols)))
-                    for idx, (title, img) in enumerate(preview_cols):
-                        cols[idx % len(cols)].image(img, caption=title, use_container_width=True)
-                else:
-                    st.info("표시할 기준 이미지 또는 mask가 없습니다.")
-
-            with fume_tab:
-                st.caption("U-Net 2차 전처리로 분리된 Fume 전용 결과를 보여줍니다.")
-                if matched_fume_frame is not None and matched_fume_frame.exists():
-                    fume_img = try_load_frame_image(str(matched_fume_frame))
-                    if fume_img is not None:
-                        st.image(fume_img, caption=f"Fume frame · {matched_fume_frame.name}", use_container_width=True)
-                elif fume_bundle.video_path is not None and fume_bundle.video_path.exists():
-                    render_video_file(fume_bundle.video_path, caption=f"Fume video · {fume_bundle.video_path.name}")
-                elif fume_bundle.frame_paths:
-                    st.info("Fume 프레임 ZIP은 업로드되어 있지만 현재 항목과 같은 이름의 프레임이 없습니다.")
-                    sample_cols = st.columns(min(3, len(fume_bundle.frame_paths[:3])))
-                    for idx, p in enumerate(fume_bundle.frame_paths[:3]):
-                        img = try_load_frame_image(str(p))
-                        if img is not None:
-                            sample_cols[idx].image(img, caption=p.name, use_container_width=True)
-                else:
-                    st.info("업로드된 Fume 결과물이 없습니다.")
-                st.caption(f"연결 정보: {row['fume_output_type']} · {row['fume_output_path'] or '-'}")
-
-            with spatter_tab:
-                st.caption("U-Net 2차 전처리로 분리된 Spatter 전용 결과를 보여줍니다.")
-                if matched_spatter_frame is not None and matched_spatter_frame.exists():
-                    sp_img = try_load_frame_image(str(matched_spatter_frame))
-                    if sp_img is not None:
-                        st.image(sp_img, caption=f"Spatter frame · {matched_spatter_frame.name}", use_container_width=True)
-                elif spatter_bundle.video_path is not None and spatter_bundle.video_path.exists():
-                    render_video_file(spatter_bundle.video_path, caption=f"Spatter video · {spatter_bundle.video_path.name}")
-                elif spatter_bundle.frame_paths:
-                    st.info("Spatter 프레임 ZIP은 업로드되어 있지만 현재 항목과 같은 이름의 프레임이 없습니다.")
-                    sample_cols = st.columns(min(3, len(spatter_bundle.frame_paths[:3])))
-                    for idx, p in enumerate(spatter_bundle.frame_paths[:3]):
-                        img = try_load_frame_image(str(p))
-                        if img is not None:
-                            sample_cols[idx].image(img, caption=p.name, use_container_width=True)
-                else:
-                    st.info("업로드된 Spatter 결과물이 없습니다.")
-                st.caption(f"연결 정보: {row['spatter_output_type']} · {row['spatter_output_path'] or '-'}")
+            if preview_cols:
+                cols = st.columns(min(3, len(preview_cols)))
+                for idx, (title, img) in enumerate(preview_cols):
+                    cols[idx % len(cols)].image(img, caption=title, use_container_width=True)
+            else:
+                st.info("표시할 기준 이미지 또는 mask가 없습니다.")
 
             with st.expander("선택 항목의 자동 분석 정보", expanded=False):
                 meta1, meta2 = st.columns(2)
